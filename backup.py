@@ -18,7 +18,7 @@ import tempfile
 import time
 from urllib.parse import quote
 
-VERSION = '0.2.2'
+VERSION = '0.3.0'
 LOCK_FILE = '.backup-manager.lock'
 SIDECARS = ('-wal', '-shm', '-journal')
 
@@ -140,7 +140,9 @@ def load_config(root):
     if unknown:
         raise BackupError(f'Unknown configuration setting(s): {", ".join(map(str, unknown))}')
     restore = section(data, 'restore', {'policy'})
-    settings = section(data, 'git', {'enabled', 'branch', 'remote', 'message', 'paths'})
+    settings = section(data, 'git', {'enabled', 'branch', 'remote', 'message', 'paths', 'scope'})
+    if settings.get('scope', 'paths') not in ('paths', 'all'):
+        raise BackupError('git.scope must be paths or all')
     deploy = section(data, 'deploy', {'enabled', 'compose_file'})
     compose_file = relative_path(root, deploy.get('compose_file', 'docker-compose.yaml'))
     targets = [(root / name).resolve() for name in ('.backup.yaml', LOCK_FILE)]
@@ -188,7 +190,8 @@ def load_config(root):
         paths = settings.get('paths', [])
         if not isinstance(paths, list):
             raise BackupError('git.paths must be a list')
-        git_paths(root, data)
+        if settings.get('scope', 'paths') == 'paths':
+            git_paths(root, data)
     return data
 
 @contextmanager
@@ -416,8 +419,11 @@ def git_run(root, *args, literal=True, **kwargs):
 def git_ignored_paths(root, paths):
     if not paths:
         return set()
+    # Prefix literal stdin paths so names such as ':settings' cannot be parsed
+    # as pathspec magic by check-ignore.
+    queries = {'./' + path: path for path in paths}
     result = git_run(root, 'check-ignore', '--no-index', '--verbose', '-z', '--stdin',
-                     literal=False, input_text=''.join(path + '\x00' for path in paths), check=False)
+                     literal=False, input_text=''.join(path + '\x00' for path in queries), check=False)
     if result.returncode not in (0, 1):
         raise BackupError(f'Cannot evaluate Git ignore rules: {result.stderr.strip()}')
     if not result.stdout:
@@ -426,8 +432,61 @@ def git_ignored_paths(root, paths):
     if fields[-1] or (len(fields) - 1) % 4:
         raise BackupError('Invalid output from git check-ignore')
     # Verbose output includes negation matches; those paths are explicitly allowed.
-    return {fields[i + 3] for i in range(0, len(fields) - 1, 4)
+    return {queries[fields[i + 3]] for i in range(0, len(fields) - 1, 4)
             if not fields[i + 2].startswith('!')}
+
+def git_all_paths(root, cfg):
+    # Include staged names even if the working tree has reverted to HEAD:
+    # all mode stages the current working-tree contents, like git add -A.
+    paths = [relative_path(root, s['snapshot']).relative_to(root).as_posix()
+             for s in cfg.get('databases', [])] + ['.backup.yaml']
+    for command in (('diff', 'HEAD', '--name-only', '--no-renames', '-z'),
+                    ('diff', '--cached', '--name-only', '--no-renames', '-z'),
+                    ('ls-files', '--others', '--exclude-standard', '-z')):
+        output = git_run(root, *command).stdout
+        paths.extend(output.split('\x00')[:-1] if output else [])
+    return list(dict.fromkeys(paths))
+
+def git_stage_paths(root, cfg, paths):
+    ignored = git_ignored_paths(root, paths)
+    runtime = list(database_paths(root, cfg)) + [root / LOCK_FILE]
+    canonical = {path.resolve() for path in runtime}
+    identities = set()
+    for path in runtime:
+        try:
+            stat = path.stat()
+            identities.add((stat.st_dev, stat.st_ino))
+        except FileNotFoundError:
+            pass
+    temporary = []
+    for spec in cfg.get('databases', []):
+        for key, suffix in (('source', '.restore.tmp'), ('snapshot', '.tmp')):
+            path = relative_path(root, spec[key])
+            temporary.append((path.parent.resolve(), '.' + path.name + '.', suffix))
+
+    def is_runtime(value):
+        path = root / value
+        try:
+            if path.resolve() in canonical:
+                return True
+            stat = path.stat()
+            if (stat.st_dev, stat.st_ino) in identities:
+                return True
+        except (OSError, RuntimeError):
+            # Git can record dangling/looping symlinks without following them.
+            pass
+        return any(path.parent.resolve() == parent and path.name.startswith(prefix)
+                   and path.name.endswith(suffix) for parent, prefix, suffix in temporary)
+
+    selected = []
+    for path in paths:
+        if path in ignored:
+            log(f'GIT: SKIP ignored path: {path}')
+        elif is_runtime(path):
+            log(f'GIT: SKIP runtime path: {path}')
+        else:
+            selected.append(path)
+    return selected
 
 def git_output(root, *args, **kwargs):
     return git_run(root, *args, **kwargs).stdout.strip()
@@ -488,7 +547,10 @@ def git_preflight(root, cfg):
     for name in ('MERGE_HEAD', 'CHERRY_PICK_HEAD', 'REVERT_HEAD', 'rebase-merge', 'rebase-apply'):
         if git_internal_path(root, name).exists():
             raise BackupError('Git operation in progress; finish it before backing up')
-    if git_run(root, 'diff', '--cached', '--quiet', check=False).returncode != 0:
+    if git_run(root, 'ls-files', '--unmerged', '-z').stdout:
+        raise BackupError('Unmerged Git entries; resolve conflicts before backing up')
+    if (settings.get('scope', 'paths') != 'all'
+            and git_run(root, 'diff', '--cached', '--quiet', check=False).returncode != 0):
         raise BackupError('Existing staged changes; refusing automatic Git commit')
     git_output(root, 'var', 'GIT_AUTHOR_IDENT')
     git_output(root, 'var', 'GIT_COMMITTER_IDENT')
@@ -497,7 +559,8 @@ def git_preflight(root, cfg):
     if tracked:
         raise BackupError('Runtime files are already tracked by Git; remove them from the index manually: '
                           + tracked.replace('\x00', ', '))
-    git_paths(root, cfg)
+    if settings.get('scope', 'paths') == 'paths':
+        git_paths(root, cfg)
     ensure_git_excludes(root, cfg)
     git_run(root, 'fetch', '--no-tags', settings.get('remote', 'origin'),
             f'refs/heads/{branch}', timeout=120)
@@ -509,7 +572,7 @@ def git_preflight(root, cfg):
     return local_sha
 
 @contextmanager
-def backup_index(root):
+def backup_index(root, *, allow_staged=False):
     # Reserve Git's normal index lock. Git writes to an alternate index, leaving
     # the user's index byte-for-byte intact on staging or commit failure.
     index = git_internal_path(root, 'index')
@@ -520,16 +583,32 @@ def backup_index(root):
         raise BackupError('Git index is locked by another operation') from e
     os.close(fd)
     try:
-        if git_run(root, 'diff', '--cached', '--quiet', check=False).returncode != 0:
+        if git_run(root, 'ls-files', '--unmerged', '-z').stdout:
+            raise BackupError('Unmerged Git entries; resolve conflicts before backing up')
+        if not allow_staged and git_run(root, 'diff', '--cached', '--quiet', check=False).returncode != 0:
             raise BackupError('Existing staged changes; refusing automatic Git commit')
         env = {'GIT_INDEX_FILE': str(lock)}
-        if index.exists():
+        if index.exists() and not allow_staged:
             shutil.copyfile(index, lock)
         else:
             git_run(root, 'read-tree', 'HEAD', env=env)
         yield env
     finally:
         lock.unlink(missing_ok=True)
+
+def install_backup_index(root, env, paths, *, preserve_unselected=False):
+    index = git_internal_path(root, 'index')
+    temporary = Path(env['GIT_INDEX_FILE'])
+    if preserve_unselected:
+        # Merge only the committed paths into the original index. Ignored staged
+        # changes stay staged and never leak into the backup commit.
+        if index.exists():
+            shutil.copyfile(index, temporary)
+        else:
+            git_run(root, 'read-tree', 'HEAD', env=env)
+        git_run(root, 'reset', '-q', 'HEAD', '--pathspec-from-file=-', '--pathspec-file-nul',
+                input_text=''.join(path + '\x00' for path in paths), env=env)
+    durable_replace(temporary, index)
 
 def git_commit_push(root, cfg, *, expected_head=None):
     settings = cfg.get('git', {})
@@ -541,25 +620,26 @@ def git_commit_push(root, cfg, *, expected_head=None):
     if (git_output(root, 'rev-parse', 'HEAD') != expected_head
             or git_output(root, 'symbolic-ref', '--short', 'HEAD') != settings.get('branch', 'master')):
         raise BackupError('Git HEAD changed during backup; refusing automatic commit')
-    paths = git_paths(root, cfg)
-    ignored = git_ignored_paths(root, paths)
-    for path in paths:
-        if path in ignored:
-            log(f'GIT: SKIP ignored path: {path}')
-    paths = [path for path in paths if path not in ignored]
-    with backup_index(root) as env:
+    all_changes = settings.get('scope', 'paths') == 'all'
+    log(f'GIT: scope={"all" if all_changes else "paths"}')
+    with backup_index(root, allow_staged=all_changes) as env:
+        candidates = git_all_paths(root, cfg) if all_changes else git_paths(root, cfg)
+        paths = git_stage_paths(root, cfg, candidates)
         # An empty path list must never turn into a repository-wide git add -A.
         if paths:
-            git_run(root, 'add', '-A', '--', *paths, env=env)
+            git_run(root, 'add', '-A', '--pathspec-from-file=-', '--pathspec-file-nul',
+                    input_text=''.join(path + '\x00' for path in paths), env=env)
         status = git_run(root, 'diff', '--cached', '--quiet', check=False, env=env)
         if status.returncode == 1:
             git_run(root, 'commit', '-m', settings.get('message', 'backup: snapshot'), env=env)
-            durable_replace(Path(env['GIT_INDEX_FILE']), git_internal_path(root, 'index'))
+            install_backup_index(root, env, paths, preserve_unselected=all_changes)
             log('GIT: created commit')
         elif status.returncode != 0:
             raise BackupError('Failed to check Git staging status')
         else:
             log('GIT: no new tracked changes')
+            if all_changes and paths:
+                install_backup_index(root, env, paths, preserve_unselected=True)
     # Retry earlier committed backups even when the snapshot is unchanged.
     branch = settings.get('branch', 'master')
     git_run(root, 'push', settings.get('remote', 'origin'), f'HEAD:refs/heads/{branch}', timeout=180)

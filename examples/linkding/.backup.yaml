@@ -13,6 +13,7 @@ restore:
   policy: if_missing
 git:
   enabled: true
+  scope: paths # Set to all to commit all non-ignored repository changes.
   remote: origin
   branch: master
   message: 'backup: linkding'

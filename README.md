@@ -1,8 +1,8 @@
-# Backup Manager v0.2.2
+# Backup Manager v0.3.0
 
 集中维护的 SQLite 备份、恢复与 Docker Compose 管理工具。每个服务目录只维护一个备份配置 `.backup.yaml`，通过统一 HTTP 入口执行；运行库、快照、Compose 文件和 Git 凭据由服务本身提供。
 
-支持 Linux / macOS、Python 3.10+、Git 和 Docker Compose v2。Python 依赖见 `requirements.txt`。`vacuum` 方法需要 SQLite 3.27+；较旧的 SQLite 可使用 `backup_api`。
+支持 Linux / macOS、Python 3.10+、Git 2.25+ 和 Docker Compose v2。Python 依赖见 `requirements.txt`。`vacuum` 方法需要 SQLite 3.27+；较旧的 SQLite 可使用 `backup_api`。
 
 ## 单个服务的配置
 
@@ -26,6 +26,7 @@ restore:
 
 git:
   enabled: true
+  scope: paths                   # paths（默认）或 all
   remote: origin
   branch: master                 # 必须与服务仓库当前分支一致
   message: 'backup: snapshot'
@@ -37,11 +38,22 @@ deploy:
   compose_file: docker-compose.yaml
 ```
 
-所有路径相对于服务目录。快照文件和 `.backup.yaml` 自动列入暂存候选，`git.paths` 只需列额外文件；旧配置重复列出快照和配置文件也兼容。该列表不接受未被忽略的目录、通配符、Git pathspec 或源数据库及其边车文件；已经被忽略的目录直接跳过。敏感文件只有在你明确配置时才会纳入，因此不要加入 `.env`、密钥等文件。
+所有路径相对于服务目录。默认 `git.scope: paths` 时，快照文件和 `.backup.yaml` 自动列入暂存候选，`git.paths` 只需列额外文件；旧配置重复列出快照和配置文件也兼容。该列表不接受未被忽略的目录、通配符、Git pathspec 或源数据库及其边车文件；已经被忽略的目录直接跳过。
+
+如果希望备份时一并提交服务仓库的全部变更，在现有 `git` 配置段中设置：
+
+```yaml
+git:
+  scope: all
+```
+
+`all` 模式包括新增、修改、删除、重命名和已有暂存内容，按工作区的当前内容提交，不受 `git.paths` 列表限制。仍按忽略规则过滤；被忽略的暂存内容不会提交，也不会被清除。请通过 `.gitignore` 排除不需要提交的 `.env`、密钥和其他本地文件。省略 `scope` 或设为 `paths` 即恢复原来的范围。
 
 工具根据 `source` 自动维护 Git 本地的 `.git/info/exclude` 生成块，忽略源库、WAL/SHM/journal、任务锁和自身临时文件，保留用户原有规则。无需另外维护备份专用 `.gitignore`。如果运行数据已经被 Git 跟踪，工具会停止并要求手动处理，不会自动删除已有跟踪记录。
 
-所有候选路径都先按 Git 当前忽略规则过滤，包括 `.gitignore`、本地 exclude、全局忽略规则及 `!` 例外规则。匹配忽略规则的文件和目录会输出 `GIT: SKIP ignored path`，不会强制暂存或因此中断任务；其余精确文件路径使用普通 `git add -A --` 暂存，不扫描整个仓库。
+所有候选路径都先按 Git 当前忽略规则过滤，包括 `.gitignore`、本地 exclude、全局忽略规则及 `!` 例外规则。匹配忽略规则的文件和目录会输出 `GIT: SKIP ignored path`，不会强制暂存或因此中断任务；其余精确文件路径通过 NUL 路径列表交给 `git add -A` 暂存，不使用 `-f`。
+
+两个模式都会排除配置中的运行数据库、WAL/SHM/journal、任务锁和工具临时文件，即使其他忽略规则把它们重新放行也不会提交；源数据库的软链接和硬链接别名也会排除。`all` 模式通过 Git 枚举候选文件，再传入以 NUL 分隔的路径列表，支持特殊文件名和大量文件，不递归强制加入目录。
 
 忽略规则也会阻止工具更新已经跟踪的候选文件，但不会自动从 Git 删除其历史或跟踪记录。被忽略的快照仍可在本地生成，**不会提交到 Git**；请让需要远端备份的快照路径通过你的忽略规则。如果全部候选路径都被忽略，本次不创建提交，但仍会尝试推送已有的待推送提交。
 
@@ -166,8 +178,8 @@ BACKUP_MANAGER_LOCAL="$PWD/backup.py" PATH="$PWD/.venv/bin:$PATH" bash service.s
 - 目前覆盖 SQLite、Git 和 Compose；PostgreSQL、MySQL、附件目录、匿名 volume、加密密钥、PVE 调度尚未实现，需要单独备份。
 - SQLite 热备份包含已经提交的 WAL 数据；快照必须是独立数据库，存在 WAL/SHM/journal 边车文件时拒绝替换或恢复。
 - `timeout_seconds` 限制单库备份的 SQLite 工作和锁等待；文件系统 I/O、fsync 或内核阻塞不属于可精确中断的时间预算。
-- Git 在创建快照前检查分支、既有暂存内容、运行库跟踪状态和远端历史，拒绝自动合并远端领先或分叉。
-- 自动提交使用独立暂存索引，并占用 Git 标准 index lock。暂存或提交失败保留原索引；提交成功而推送失败时，下次任务会重推已有提交。进程被强制终止后若残留 Git index lock，需要先确认无 Git 进程，再人工处理。
+- Git 在创建快照前检查分支、运行库跟踪状态和远端历史，拒绝自动合并远端领先或分叉，也拒绝未解决的 Git 冲突。默认 `paths` 模式还拒绝既有暂存内容；`all` 模式明确允许纳入符合规则的既有暂存内容。
+- 自动提交使用独立暂存索引，并占用 Git 标准 index lock。暂存或提交失败保留原索引；`all` 模式成功后仅同步已处理路径，保留被排除文件的原暂存内容。提交成功而推送失败时，下次任务会重推已有提交。进程被强制终止后若残留 Git index lock，需要先确认无 Git 进程，再人工处理。
 - 恢复使用原子、不覆盖目标的链接操作；容器运行、暂停、重启、状态未知或查询失败时拒绝恢复。`deploy.enabled: false` 的手动恢复由调用者确保数据库没有被其他进程使用。
 - 多个数据库分别快照，未实现跨库全局一致性；部分备份失败时不提交 Git，但已经成功生成的快照会保留。多个数据库恢复也不是整体事务，需做真实的恢复演练。
 - SQLite `quick_check` 验证结构完整性，不验证应用业务内容。Git 备份保留历史数据，仓库应私有并配置恰当的访问权限、容量管理和无交互认证。

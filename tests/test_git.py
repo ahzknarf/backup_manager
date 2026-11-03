@@ -12,7 +12,7 @@ import backup as bm
 BASE = Path(__file__).resolve().parents[1]
 
 
-class GitSafetyTests(unittest.TestCase):
+class GitTestCase(unittest.TestCase):
     def setUp(self):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
@@ -64,6 +64,8 @@ class GitSafetyTests(unittest.TestCase):
         path.write_text('#!/bin/sh\n' + content + '\n')
         path.chmod(0o700)
 
+
+class GitSafetyTests(GitTestCase):
     def test_single_config_derives_exclusions_and_keeps_unrelated_changes(self):
         (self.root / '.env').write_text('SECRET=test-only\n')
         (self.root / 'notes.txt').write_text('uncommitted\n')
