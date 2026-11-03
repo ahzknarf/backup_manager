@@ -141,23 +141,57 @@ def select_release(cache, manifest_url, *, offline=False):
         return result
 
 
-def python_with_yaml(base_cache):
+def python_has_module(python, module, *, virtual=False):
+    if not Path(python).is_file():
+        return False
+    code = 'import sys\n'
+    if virtual:
+        code += 'if sys.prefix == sys.base_prefix:\n    sys.exit(1)\n'
+    code += 'import ' + module
     try:
-        import yaml
+        result = subprocess.run([str(python), '-c', code], stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL, timeout=30)
+        return result.returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def dependency_help():
+    package = f'python{sys.version_info.major}.{sys.version_info.minor}-venv'
+    return ('Install PyYAML for the invoking Python, or install its venv/ensurepip support.\n'
+            'On Debian/Ubuntu using /usr/bin/python3, the simplest fix is:\n'
+            '  apt-get update && apt-get install -y python3-yaml\n'
+            'Alternatively, enable venv for this Python version:\n'
+            f'  apt-get update && apt-get install -y {package}\n'
+            'Then rerun the launcher; incomplete cached environments are repaired automatically.')
+
+
+def python_with_yaml(base_cache):
+    if python_has_module(sys.executable, 'yaml'):
         return sys.executable
-    except ImportError:
-        environment = base_cache / 'venv'
-        python = environment / 'bin' / 'python3'
-        if not python.is_file():
-            subprocess.run([sys.executable, '-m', 'venv', str(environment)], check=True, timeout=120)
-        check = subprocess.run([str(python), '-c', 'import yaml'], stdout=subprocess.DEVNULL,
-                               stderr=subprocess.DEVNULL, timeout=30)
-        if check.returncode:
-            if os.environ.get('BACKUP_MANAGER_OFFLINE') == '1':
-                raise RuntimeError('PyYAML is not installed in the cached environment; cannot install offline')
-            subprocess.run([str(python), '-m', 'pip', 'install', '--disable-pip-version-check',
-                            YAML_REQUIREMENT], check=True, timeout=180)
+    environment = base_cache / 'venv'
+    python = environment / 'bin' / 'python3'
+    if python_has_module(python, 'yaml', virtual=True):
         return str(python)
+    if os.environ.get('BACKUP_MANAGER_OFFLINE') == '1':
+        raise RuntimeError('PyYAML is unavailable in the system or cached venv; cannot install offline')
+    # A failed ensurepip step can leave bin/python3 behind without pip. Probe
+    # the environment instead of treating the presence of Python as success.
+    if not python_has_module(python, 'pip', virtual=True):
+        try:
+            subprocess.run([sys.executable, '-m', 'venv', str(environment)], check=True,
+                           capture_output=True, text=True, timeout=120)
+        except (OSError, subprocess.SubprocessError) as error:
+            detail = (getattr(error, 'stderr', '') or getattr(error, 'stdout', '') or str(error)).strip()
+            raise RuntimeError(f'Cannot create or repair cached venv: {detail[-2000:]}\n'
+                               + dependency_help()) from error
+        if not python_has_module(python, 'pip', virtual=True):
+            raise RuntimeError('Cached venv still has no working pip after recreation.\n' + dependency_help())
+    subprocess.run([str(python), '-m', 'pip', 'install', '--disable-pip-version-check',
+                    YAML_REQUIREMENT], check=True, timeout=180)
+    if not python_has_module(python, 'yaml', virtual=True):
+        raise RuntimeError(f'PyYAML installation finished but import failed: {python}')
+    return str(python)
 
 
 def main():
