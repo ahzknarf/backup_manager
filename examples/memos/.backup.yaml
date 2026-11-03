@@ -1,0 +1,25 @@
+version: 1
+
+databases:
+  - type: sqlite
+    source: data/memos_prod.db
+    snapshot: data/backup_memos_prod.db
+    method: vacuum
+    restore_mode: '0600'
+
+restore:
+  policy: if_missing
+
+git:
+  enabled: true
+  remote: origin
+  branch: master
+  message: 'backup: memos'
+  paths:
+    - data/backup_memos_prod.db
+    - .backup.yaml
+    - docker-compose.yaml
+
+deploy:
+  enabled: true
+  compose_file: docker-compose.yaml

@@ -1,0 +1,26 @@
+version: 1
+
+databases:
+  - type: sqlite
+    source: data/db.sqlite3
+    snapshot: data/backup.db.sqlite3
+    method: vacuum
+  - type: sqlite
+    source: data/task.sqlite3
+    snapshot: data/backup.task.sqlite3
+    method: vacuum
+restore:
+  policy: if_missing
+git:
+  enabled: true
+  remote: origin
+  branch: master
+  message: 'backup: linkding'
+  paths:
+    - data/backup.db.sqlite3
+    - data/backup.task.sqlite3
+    - .backup.yaml
+    - docker-compose.yaml
+deploy:
+  enabled: true
+  compose_file: docker-compose.yaml
