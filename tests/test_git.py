@@ -175,17 +175,19 @@ class GitSafetyTests(unittest.TestCase):
         self.snapshot = self.root / 'backups/memos_prod.db'
         self.save()
 
-    def test_ignored_parent_and_database_suffix_only_commit_managed_files(self):
+    def test_ignored_snapshots_are_only_created_locally_and_empty_selection_is_safe(self):
         self.configure_ignored_snapshot()
         (self.root / '.gitignore').write_text('/backups/\n*.db\n.backup.yaml\n')
         self.snapshot.parent.mkdir()
         (self.snapshot.parent / 'secret.txt').write_text('must not be committed\n')
         (self.snapshot.parent / 'other.db').write_bytes(self.source.read_bytes())
         (self.root / '.env').write_text('SECRET=test-only\n')
-        self.tool()
+        output = self.tool()
         tracked = self.git('ls-files').splitlines()
-        self.assertIn('backups/memos_prod.db', tracked)
-        for path in ('data/live.db', 'backups/secret.txt', 'backups/other.db', '.env', '.gitignore'):
+        self.assertIn('SKIP ignored path: backups/memos_prod.db', output)
+        self.assertIn('SKIP ignored path: .backup.yaml', output)
+        self.assertTrue(self.snapshot.is_file())
+        for path in ('backups/memos_prod.db', 'data/live.db', 'backups/secret.txt', 'backups/other.db', '.env', '.gitignore'):
             self.assertNotIn(path, tracked)
         self.assertEqual(self.git('diff', '--cached', '--name-only'), '')
         with sqlite3.connect(self.source) as connection:
@@ -195,34 +197,80 @@ class GitSafetyTests(unittest.TestCase):
         with sqlite3.connect(self.snapshot) as connection:
             self.assertEqual(connection.execute('select value from items').fetchone()[0], 'next snapshot')
         connection.close()
-        self.assertEqual(self.git('rev-list', '--count', 'HEAD'), '3')
+        self.assertEqual(self.git('rev-list', '--count', 'HEAD'), '1')
 
-    def test_untracked_ignored_configuration_is_managed_explicitly(self):
+    def test_untracked_ignored_configuration_is_skipped(self):
         self.configure_ignored_snapshot()
         self.git('rm', '--cached', '.backup.yaml')
         self.git('commit', '-m', 'remove configuration from index')
         self.git('push')
         (self.root / '.gitignore').write_text('/backups/\n.backup.yaml\n')
+        previous_index = (self.root / '.git/index').read_bytes()
         self.tool()
-        self.assertIn('.backup.yaml', self.git('ls-files').splitlines())
-        self.assertIn('backups/memos_prod.db', self.git('ls-files').splitlines())
+        self.assertNotIn('.backup.yaml', self.git('ls-files').splitlines())
+        self.assertNotIn('backups/memos_prod.db', self.git('ls-files').splitlines())
+        self.assertEqual((self.root / '.git/index').read_bytes(), previous_index)
 
-    def test_ignored_extra_file_stays_protected_and_index_survives_failure(self):
+    def test_ignored_extra_files_are_skipped_without_failing_backup(self):
         self.configure_ignored_snapshot()
-        (self.root / '.gitignore').write_text('/backups/\n/secret.txt\n')
+        (self.root / '.gitignore').write_text('/secret.txt\n')
         (self.root / 'secret.txt').write_text('must remain ignored\n')
         self.config['git']['paths'] = ['secret.txt']
         self.save()
-        index = self.root / '.git/index'
-        previous = index.read_bytes()
-        self.assertIn('ignored', self.tool(expected=1))
-        self.assertEqual(index.read_bytes(), previous)
+        self.assertIn('SKIP ignored path: secret.txt', self.tool())
         self.assertNotIn('secret.txt', self.git('ls-files').splitlines())
-        self.assertFalse(Path(str(index) + '.lock').exists())
-        self.config['git']['paths'] = []
+        self.assertIn('backups/memos_prod.db', self.git('ls-files').splitlines())
+        self.assertFalse((self.root / '.git/index.lock').exists())
+        self.assertEqual(self.git('diff', '--cached', '--name-only'), '')
+
+    def test_ignored_directory_in_configuration_is_skipped(self):
+        ignored = self.root / 'private-files'
+        ignored.mkdir()
+        (ignored / 'secret.txt').write_text('must not be committed\n')
+        (self.root / '.gitignore').write_text('/private-files/\n')
+        self.config['git']['paths'] = ['private-files']
         self.save()
+        self.assertIn('SKIP ignored path: private-files', self.tool())
+        self.assertNotIn('private-files/secret.txt', self.git('ls-files').splitlines())
+        self.assertIn('data/snapshot.db', self.git('ls-files').splitlines())
+
+    def test_negated_ignore_rule_allows_only_selected_snapshot(self):
+        self.configure_ignored_snapshot()
+        (self.root / '.gitignore').write_text('/backups/*\n!/backups/memos_prod.db\n')
+        self.snapshot.parent.mkdir()
+        (self.snapshot.parent / 'secret.txt').write_text('must remain ignored\n')
         self.tool()
-        self.assertNotIn('secret.txt', self.git('ls-files').splitlines())
+        self.assertIn('backups/memos_prod.db', self.git('ls-files').splitlines())
+        self.assertNotIn('backups/secret.txt', self.git('ls-files').splitlines())
+
+    def test_now_ignored_tracked_file_is_left_unchanged_in_git(self):
+        self.config['git']['paths'] = ['notes.txt']
+        self.save()
+        (self.root / 'notes.txt').write_text('local changes\n')
+        (self.root / '.gitignore').write_text('/notes.txt\n')
+        self.assertIn('SKIP ignored path: notes.txt', self.tool())
+        self.assertEqual(self.git('show', 'HEAD:notes.txt'), 'original')
+        self.assertEqual((self.root / 'notes.txt').read_text(), 'local changes\n')
+        self.assertEqual(self.git('diff', '--cached', '--name-only'), '')
+
+    def test_allowed_tracked_file_deletion_is_committed(self):
+        self.config['git']['paths'] = ['notes.txt']
+        self.save()
+        (self.root / 'notes.txt').unlink()
+        self.tool()
+        self.assertNotIn('notes.txt', self.git('ls-files').splitlines())
+        self.assertEqual(self.git('diff', '--cached', '--name-only'), '')
+
+    def test_local_excludes_and_paths_with_spaces_are_respected(self):
+        with (self.root / '.git/info/exclude').open('a') as exclude:
+            exclude.write('\n/local secret.txt\n')
+        (self.root / 'local secret.txt').write_text('ignored\n')
+        (self.root / 'allowed file.yaml').write_text('allowed: true\n')
+        self.config['git']['paths'] = ['local secret.txt', 'allowed file.yaml']
+        self.save()
+        self.assertIn('SKIP ignored path: local secret.txt', self.tool())
+        self.assertNotIn('local secret.txt', self.git('ls-files').splitlines())
+        self.assertIn('allowed file.yaml', self.git('ls-files').splitlines())
 
 
 if __name__ == '__main__':

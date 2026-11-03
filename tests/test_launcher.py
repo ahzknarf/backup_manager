@@ -45,9 +45,9 @@ class LauncherTests(unittest.TestCase):
         (cache / name).write_text(json.dumps(manifest))
         self.launcher.tool_path(cache, manifest).write_bytes(code)
 
-    def select(self):
+    def select(self, **kwargs):
         with contextlib.redirect_stderr(io.StringIO()):
-            return self.launcher.select_release(self.cache, self.url)
+            return self.launcher.select_release(self.cache, self.url, **kwargs)
 
     def test_dotted_release_version_is_accepted(self):
         self.assertEqual(self.launcher.parse_manifest(json.dumps(self.old)), self.old)
@@ -118,6 +118,103 @@ class LauncherTests(unittest.TestCase):
         with mock.patch.object(self.launcher, 'download', side_effect=OSError('offline')):
             with self.assertRaisesRegex(RuntimeError, 'Cannot obtain a verified tool'):
                 self.launcher.select_release(self.cache, self.url)
+
+    def test_require_update_refuses_good_old_cache_when_network_fails(self):
+        before = (self.cache / 'stable.json').read_bytes()
+        with mock.patch.object(self.launcher, 'download', side_effect=TimeoutError('read timed out')):
+            with self.assertRaisesRegex(RuntimeError, 'refusing cached release'):
+                self.select(require_update=True)
+        self.assertEqual((self.cache / 'stable.json').read_bytes(), before)
+
+    def test_require_update_accepts_verified_update_but_rejects_bad_hash(self):
+        code = b"print('new release')\n"
+        manifest = self.manifest('v0.2.1', code)
+        with mock.patch.object(self.launcher, 'download', side_effect=[json.dumps(manifest).encode(), b'wrong content']):
+            with self.assertRaisesRegex(RuntimeError, 'SHA-256 mismatch'):
+                self.select(require_update=True)
+        with mock.patch.object(self.launcher, 'download', side_effect=[json.dumps(manifest).encode(), code]):
+            selected, path = self.select(require_update=True)
+        self.assertEqual(selected, manifest)
+        self.assertEqual(path.read_bytes(), code)
+
+    def test_require_update_and_offline_conflict_before_reading_cache(self):
+        with mock.patch.object(self.launcher, 'download') as download:
+            with self.assertRaisesRegex(ValueError, 'cannot be combined'):
+                self.launcher.select_release(self.cache, self.url, require_update=True, offline=True)
+        download.assert_not_called()
+
+    def test_fallback_warning_names_the_actual_cached_version(self):
+        warnings = io.StringIO()
+        with mock.patch.object(self.launcher, 'download', side_effect=TimeoutError('read timed out')), \
+                contextlib.redirect_stderr(warnings):
+            self.launcher.select_release(self.cache, self.url)
+        self.assertIn('using verified cached release v0.1.0', warnings.getvalue())
+        self.assertIn(self.old['sha256'][:12], warnings.getvalue())
+
+    def test_download_retries_transient_errors_with_configurable_timeout(self):
+        failures = [TimeoutError('read timed out'), http.client.IncompleteRead(b'partial'), b'complete']
+        env = {'BACKUP_MANAGER_DOWNLOAD_TIMEOUT': '60', 'BACKUP_MANAGER_DOWNLOAD_ATTEMPTS': '3'}
+        with mock.patch.object(self.launcher, 'download_once', side_effect=failures) as download, \
+                mock.patch.object(self.launcher.time, 'sleep') as sleep, \
+                mock.patch.dict(os.environ, env), contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(self.launcher.download(self.url), b'complete')
+        self.assertEqual(download.call_count, 3)
+        download.assert_called_with(self.url, 2_000_000, 60)
+        self.assertEqual(sleep.call_count, 2)
+
+    def test_download_stops_after_configured_attempt_count(self):
+        with mock.patch.object(self.launcher, 'download_once', side_effect=TimeoutError('read timed out')) as download, \
+                mock.patch.object(self.launcher.time, 'sleep'), \
+                mock.patch.dict(os.environ, {'BACKUP_MANAGER_DOWNLOAD_ATTEMPTS': '2'}), \
+                contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(TimeoutError):
+                self.launcher.download(self.url)
+        self.assertEqual(download.call_count, 2)
+
+    def test_download_retries_503_but_fails_fast_on_404(self):
+        error = self.launcher.urllib.error.HTTPError
+        with mock.patch.object(self.launcher, 'download_once', side_effect=[error(self.url, 503, '', {}, None), b'ok']), \
+                mock.patch.object(self.launcher.time, 'sleep'), \
+                mock.patch.dict(os.environ, {'BACKUP_MANAGER_DOWNLOAD_ATTEMPTS': '3'}), \
+                contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(self.launcher.download(self.url), b'ok')
+        with mock.patch.object(self.launcher, 'download_once', side_effect=error(self.url, 404, '', {}, None)) as download, \
+                mock.patch.object(self.launcher.time, 'sleep') as sleep:
+            with self.assertRaises(error):
+                self.launcher.download(self.url)
+        download.assert_called_once()
+        sleep.assert_not_called()
+
+    def test_download_settings_are_validated_before_network_access(self):
+        for setting, value in [('BACKUP_MANAGER_DOWNLOAD_TIMEOUT', '0'),
+                               ('BACKUP_MANAGER_DOWNLOAD_TIMEOUT', 'nan'),
+                               ('BACKUP_MANAGER_DOWNLOAD_TIMEOUT', '301'),
+                               ('BACKUP_MANAGER_DOWNLOAD_ATTEMPTS', '0'),
+                               ('BACKUP_MANAGER_DOWNLOAD_ATTEMPTS', '11')]:
+            with self.subTest(setting=setting, value=value), \
+                    mock.patch.dict(os.environ, {setting: value}), \
+                    mock.patch.object(self.launcher, 'download_once') as download:
+                with self.assertRaises(ValueError):
+                    self.launcher.download(self.url)
+                download.assert_not_called()
+
+    def test_launcher_reports_selected_version_and_consumes_require_update_flag(self):
+        repo = self.cache / 'service'
+        repo.mkdir()
+        (repo / '.backup.yaml').write_text('version: 1\n')
+        env = {'BACKUP_MANAGER_LOCAL': '', 'BACKUP_MANAGER_OFFLINE': '0',
+               'BACKUP_MANAGER_CACHE_DIR': str(self.cache)}
+        warnings = io.StringIO()
+        with mock.patch.dict(os.environ, env), \
+                mock.patch.object(sys, 'argv', ['service.sh', '--repo', str(repo), '--require-update', 'backup']), \
+                mock.patch.object(self.launcher, 'python_with_yaml', return_value=sys.executable), \
+                mock.patch.object(self.launcher, 'select_release', return_value=(self.old, self.cache / 'engine.py')) as select, \
+                mock.patch.object(self.launcher.os, 'execv') as execute, contextlib.redirect_stderr(warnings):
+            self.launcher.main()
+        self.assertTrue(select.call_args.kwargs['require_update'])
+        self.assertNotIn('--require-update', execute.call_args.args[1])
+        self.assertIn('release=v0.1.0', warnings.getvalue())
+        self.assertIn(self.old['sha256'], warnings.getvalue())
 
     def test_redirect_to_http_is_rejected_before_following(self):
         handler = self.launcher.HTTPSRedirects()

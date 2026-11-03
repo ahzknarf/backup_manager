@@ -18,7 +18,7 @@ import tempfile
 import time
 from urllib.parse import quote
 
-VERSION = '0.2.1'
+VERSION = '0.2.2'
 LOCK_FILE = '.backup-manager.lock'
 SIDECARS = ('-wal', '-shm', '-journal')
 
@@ -28,11 +28,11 @@ class BackupError(Exception):
 def log(msg):
     print(f'[{dt.datetime.now().astimezone().isoformat(timespec="seconds")}] {msg}', flush=True)
 
-def run(argv, cwd, *, capture=True, timeout=300, check=True, env=None):
+def run(argv, cwd, *, capture=True, timeout=300, check=True, env=None, input_text=None):
     try:
         p = subprocess.run(argv, cwd=str(cwd), text=True, stdout=subprocess.PIPE if capture else None,
                            stderr=subprocess.PIPE if capture else None, timeout=timeout, check=False,
-                           env={**os.environ, **env} if env is not None else None)
+                           env={**os.environ, **env} if env is not None else None, input=input_text)
     except (OSError, subprocess.TimeoutExpired) as e:
         raise BackupError(f'Command failed: {argv[0]} ({e})') from e
     if check and p.returncode:
@@ -86,7 +86,7 @@ def positive_seconds(value, label):
     return value
 
 def git_paths(root, cfg):
-    # Snapshot/config paths are always included. git.paths only adds explicit files.
+    # Build candidates first; current Git ignore rules decide which get staged.
     values = [s['snapshot'] for s in cfg.get('databases', [])] + ['.backup.yaml']
     values += cfg.get('git', {}).get('paths', [])
     paths = []
@@ -96,11 +96,11 @@ def git_paths(root, cfg):
         path = relative_path(root, value)
         if any(c in value for c in ':*?[]'):
             raise BackupError(f'git.paths accepts literal files only: {value}')
-        if path.is_dir():
+        normalized = path.relative_to(root).as_posix()
+        if path.is_dir() and normalized not in git_ignored_paths(root, [normalized]):
             raise BackupError(f'git.paths cannot include a directory: {value}')
         if path.resolve() in runtime:
             raise BackupError(f'git.paths cannot include a live database or runtime file: {value}')
-        normalized = path.relative_to(root).as_posix()
         if normalized not in paths:
             paths.append(normalized)
     return paths
@@ -406,9 +406,28 @@ def restore_all(root, cfg, *, dry_run=False):
         finally:
             tmp.unlink(missing_ok=True)
 
-def git_run(root, *args, **kwargs):
+def git_run(root, *args, literal=True, **kwargs):
     env = {'GIT_TERMINAL_PROMPT': '0', 'GIT_OPTIONAL_LOCKS': '0', **kwargs.pop('env', {})}
-    return run(['git', '--literal-pathspecs', *args], root, env=env, **kwargs)
+    if not literal:
+        # check-ignore accepts literal stdin paths, but rejects literal pathspec magic.
+        env['GIT_LITERAL_PATHSPECS'] = '0'
+    return run(['git', *(['--literal-pathspecs'] if literal else []), *args], root, env=env, **kwargs)
+
+def git_ignored_paths(root, paths):
+    if not paths:
+        return set()
+    result = git_run(root, 'check-ignore', '--no-index', '--verbose', '-z', '--stdin',
+                     literal=False, input_text=''.join(path + '\x00' for path in paths), check=False)
+    if result.returncode not in (0, 1):
+        raise BackupError(f'Cannot evaluate Git ignore rules: {result.stderr.strip()}')
+    if not result.stdout:
+        return set()
+    fields = result.stdout.split('\x00')
+    if fields[-1] or (len(fields) - 1) % 4:
+        raise BackupError('Invalid output from git check-ignore')
+    # Verbose output includes negation matches; those paths are explicitly allowed.
+    return {fields[i + 3] for i in range(0, len(fields) - 1, 4)
+            if not fields[i + 2].startswith('!')}
 
 def git_output(root, *args, **kwargs):
     return git_run(root, *args, **kwargs).stdout.strip()
@@ -523,17 +542,15 @@ def git_commit_push(root, cfg, *, expected_head=None):
             or git_output(root, 'symbolic-ref', '--short', 'HEAD') != settings.get('branch', 'master')):
         raise BackupError('Git HEAD changed during backup; refusing automatic commit')
     paths = git_paths(root, cfg)
-    managed = {relative_path(root, spec['snapshot']).relative_to(root).as_posix()
-               for spec in cfg.get('databases', [])} | {'.backup.yaml'}
-    snapshots_and_config = [path for path in paths if path in managed]
-    extra_files = [path for path in paths if path not in managed]
+    ignored = git_ignored_paths(root, paths)
+    for path in paths:
+        if path in ignored:
+            log(f'GIT: SKIP ignored path: {path}')
+    paths = [path for path in paths if path not in ignored]
     with backup_index(root) as env:
-        # Explicit managed files must work even in an ignored backups directory.
-        # Never force-add a directory or the optional git.paths allowlist.
-        if snapshots_and_config:
-            git_run(root, 'add', '-A', '-f', '--', *snapshots_and_config, env=env)
-        if extra_files:
-            git_run(root, 'add', '-A', '--', *extra_files, env=env)
+        # An empty path list must never turn into a repository-wide git add -A.
+        if paths:
+            git_run(root, 'add', '-A', '--', *paths, env=env)
         status = git_run(root, 'diff', '--cached', '--quiet', check=False, env=env)
         if status.returncode == 1:
             git_run(root, 'commit', '-m', settings.get('message', 'backup: snapshot'), env=env)

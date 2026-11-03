@@ -7,12 +7,15 @@ import fcntl
 import hashlib
 import http.client
 import json
+import math
 import os
 from pathlib import Path
 import re
 import subprocess
 import sys
 import tempfile
+import time
+import urllib.error
 import urllib.parse
 import urllib.request
 
@@ -40,15 +43,38 @@ class HTTPSRedirects(urllib.request.HTTPRedirectHandler):
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
-def download(url, limit=2_000_000):
+def download_once(url, limit, timeout):
     request = urllib.request.Request(https_url(url), headers={'User-Agent': 'backup-manager-launcher/0.2'})
     opener = urllib.request.build_opener(HTTPSRedirects())
-    with opener.open(request, timeout=15) as response:
+    with opener.open(request, timeout=timeout) as response:
         https_url(response.geturl())
         body = response.read(limit + 1)
     if len(body) > limit:
         raise ValueError('Download too large')
     return body
+
+
+def download(url, limit=2_000_000):
+    https_url(url)
+    timeout = float(os.environ.get('BACKUP_MANAGER_DOWNLOAD_TIMEOUT', '30'))
+    attempts = int(os.environ.get('BACKUP_MANAGER_DOWNLOAD_ATTEMPTS', '3'))
+    if not math.isfinite(timeout) or not 0 < timeout <= 300:
+        raise ValueError('BACKUP_MANAGER_DOWNLOAD_TIMEOUT must be greater than 0 and at most 300 seconds')
+    if not 1 <= attempts <= 10:
+        raise ValueError('BACKUP_MANAGER_DOWNLOAD_ATTEMPTS must be between 1 and 10')
+    for attempt in range(attempts):
+        try:
+            return download_once(url, limit, timeout)
+        except (OSError, http.client.HTTPException) as error:
+            if isinstance(error, urllib.error.HTTPError):
+                error.close()
+                if error.code not in (408, 429, 500, 502, 503, 504):
+                    raise
+            if attempt + 1 == attempts:
+                raise
+            print(f'Warning: download {attempt + 1}/{attempts} failed for '
+                  f'{urllib.parse.urlsplit(url).hostname}: {error}; retrying', file=sys.stderr)
+            time.sleep(min(2 ** attempt, 5))
 
 
 def parse_manifest(content):
@@ -108,7 +134,9 @@ def cached_release(cache):
     raise RuntimeError('No verified cached release: ' + '; '.join(errors))
 
 
-def select_release(cache, manifest_url, *, offline=False):
+def select_release(cache, manifest_url, *, offline=False, require_update=False):
+    if offline and require_update:
+        raise ValueError('--require-update cannot be combined with BACKUP_MANAGER_OFFLINE=1')
     if offline:
         return cached_release(cache)
     try:
@@ -133,11 +161,15 @@ def select_release(cache, manifest_url, *, offline=False):
         atomic_write(cache / 'stable.json', json.dumps(manifest).encode())
         return manifest, path
     except (OSError, ValueError, SyntaxError, RuntimeError, http.client.HTTPException) as error:
+        if require_update:
+            raise RuntimeError(f'Update required but download or verification failed; '
+                               f'refusing cached release: {error}') from error
         try:
             result = cached_release(cache)
         except RuntimeError as cached_error:
             raise RuntimeError(f'Cannot obtain a verified tool ({error}); {cached_error}') from error
-        print(f'Warning: using verified cached release ({error})', file=sys.stderr)
+        print(f'Warning: using verified cached release {result[0]["version"]} '
+              f'sha256={result[0]["sha256"][:12]} ({error})', file=sys.stderr)
         return result
 
 
@@ -197,6 +229,8 @@ def python_with_yaml(base_cache):
 def main():
     parser = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
     parser.add_argument('--repo', default='.')
+    parser.add_argument('--require-update', action='store_true',
+                        help='Require a verified online release; never fall back to an older cache')
     args, forwarded = parser.parse_known_args()
     repo = Path(args.repo).expanduser().resolve()
     if not (repo / '.backup.yaml').is_file():
@@ -216,8 +250,10 @@ def main():
     with open(base_cache / '.download.lock', 'a+b') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         python = python_with_yaml(base_cache)
-        _, executable = select_release(cache, manifest_url,
-                                       offline=os.environ.get('BACKUP_MANAGER_OFFLINE') == '1')
+        manifest, executable = select_release(cache, manifest_url,
+                                             offline=os.environ.get('BACKUP_MANAGER_OFFLINE') == '1',
+                                             require_update=args.require_update)
+        print(f'Launcher: release={manifest["version"]} sha256={manifest["sha256"]}', file=sys.stderr)
     os.execv(python, [python, str(executable), '--repo', str(repo), *forwarded])
 
 
