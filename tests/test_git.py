@@ -170,6 +170,60 @@ class GitSafetyTests(unittest.TestCase):
         self.assertEqual(lock.read_bytes(), b'another-operation')
         self.assertFalse(self.snapshot.exists())
 
+    def configure_ignored_snapshot(self):
+        self.config['databases'][0]['snapshot'] = 'backups/memos_prod.db'
+        self.snapshot = self.root / 'backups/memos_prod.db'
+        self.save()
+
+    def test_ignored_parent_and_database_suffix_only_commit_managed_files(self):
+        self.configure_ignored_snapshot()
+        (self.root / '.gitignore').write_text('/backups/\n*.db\n.backup.yaml\n')
+        self.snapshot.parent.mkdir()
+        (self.snapshot.parent / 'secret.txt').write_text('must not be committed\n')
+        (self.snapshot.parent / 'other.db').write_bytes(self.source.read_bytes())
+        (self.root / '.env').write_text('SECRET=test-only\n')
+        self.tool()
+        tracked = self.git('ls-files').splitlines()
+        self.assertIn('backups/memos_prod.db', tracked)
+        for path in ('data/live.db', 'backups/secret.txt', 'backups/other.db', '.env', '.gitignore'):
+            self.assertNotIn(path, tracked)
+        self.assertEqual(self.git('diff', '--cached', '--name-only'), '')
+        with sqlite3.connect(self.source) as connection:
+            connection.execute("update items set value='next snapshot'")
+        connection.close()
+        self.tool()
+        with sqlite3.connect(self.snapshot) as connection:
+            self.assertEqual(connection.execute('select value from items').fetchone()[0], 'next snapshot')
+        connection.close()
+        self.assertEqual(self.git('rev-list', '--count', 'HEAD'), '3')
+
+    def test_untracked_ignored_configuration_is_managed_explicitly(self):
+        self.configure_ignored_snapshot()
+        self.git('rm', '--cached', '.backup.yaml')
+        self.git('commit', '-m', 'remove configuration from index')
+        self.git('push')
+        (self.root / '.gitignore').write_text('/backups/\n.backup.yaml\n')
+        self.tool()
+        self.assertIn('.backup.yaml', self.git('ls-files').splitlines())
+        self.assertIn('backups/memos_prod.db', self.git('ls-files').splitlines())
+
+    def test_ignored_extra_file_stays_protected_and_index_survives_failure(self):
+        self.configure_ignored_snapshot()
+        (self.root / '.gitignore').write_text('/backups/\n/secret.txt\n')
+        (self.root / 'secret.txt').write_text('must remain ignored\n')
+        self.config['git']['paths'] = ['secret.txt']
+        self.save()
+        index = self.root / '.git/index'
+        previous = index.read_bytes()
+        self.assertIn('ignored', self.tool(expected=1))
+        self.assertEqual(index.read_bytes(), previous)
+        self.assertNotIn('secret.txt', self.git('ls-files').splitlines())
+        self.assertFalse(Path(str(index) + '.lock').exists())
+        self.config['git']['paths'] = []
+        self.save()
+        self.tool()
+        self.assertNotIn('secret.txt', self.git('ls-files').splitlines())
+
 
 if __name__ == '__main__':
     unittest.main()

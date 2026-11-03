@@ -51,7 +51,8 @@ class LauncherTests(unittest.TestCase):
 
     def test_dotted_release_version_is_accepted(self):
         self.assertEqual(self.launcher.parse_manifest(json.dumps(self.old)), self.old)
-        self.assertEqual(self.launcher.parse_manifest((BASE / 'stable.json').read_bytes())['version'], 'v0.2.0')
+        self.assertRegex(self.launcher.parse_manifest((BASE / 'stable.json').read_bytes())['version'],
+                         r'^v[0-9]+\.[0-9]+\.[0-9]+$')
 
     def test_invalid_manifest_does_not_poison_good_cache(self):
         original = (self.cache / 'stable.json').read_bytes()

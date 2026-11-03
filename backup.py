@@ -18,7 +18,7 @@ import tempfile
 import time
 from urllib.parse import quote
 
-VERSION = '0.2.0'
+VERSION = '0.2.1'
 LOCK_FILE = '.backup-manager.lock'
 SIDECARS = ('-wal', '-shm', '-journal')
 
@@ -522,8 +522,18 @@ def git_commit_push(root, cfg, *, expected_head=None):
     if (git_output(root, 'rev-parse', 'HEAD') != expected_head
             or git_output(root, 'symbolic-ref', '--short', 'HEAD') != settings.get('branch', 'master')):
         raise BackupError('Git HEAD changed during backup; refusing automatic commit')
+    paths = git_paths(root, cfg)
+    managed = {relative_path(root, spec['snapshot']).relative_to(root).as_posix()
+               for spec in cfg.get('databases', [])} | {'.backup.yaml'}
+    snapshots_and_config = [path for path in paths if path in managed]
+    extra_files = [path for path in paths if path not in managed]
     with backup_index(root) as env:
-        git_run(root, 'add', '-A', '--', *git_paths(root, cfg), env=env)
+        # Explicit managed files must work even in an ignored backups directory.
+        # Never force-add a directory or the optional git.paths allowlist.
+        if snapshots_and_config:
+            git_run(root, 'add', '-A', '-f', '--', *snapshots_and_config, env=env)
+        if extra_files:
+            git_run(root, 'add', '-A', '--', *extra_files, env=env)
         status = git_run(root, 'diff', '--cached', '--quiet', check=False, env=env)
         if status.returncode == 1:
             git_run(root, 'commit', '-m', settings.get('message', 'backup: snapshot'), env=env)
