@@ -1,78 +1,148 @@
-# Backup Manager MVP v0.2.0
+# Backup Manager v0.2.0
 
-单仓库备份/恢复工具。各服务仓库只维护 `.backup.yaml`，中心仓库发布 `backup.py` 和 `stable.json`。本版不需要 PVE 才能运行。
+集中维护的 SQLite 备份、恢复与 Docker Compose 管理工具。每个服务目录只维护一个备份配置 `.backup.yaml`，通过统一 HTTP 入口执行；运行库、快照、Compose 文件和 Git 凭据由服务本身提供。
 
-## 是否新建仓库？
+支持 Linux / macOS、Python 3.10+、Git 和 Docker Compose v2。Python 依赖见 `requirements.txt`。`vacuum` 方法需要 SQLite 3.27+；较旧的 SQLite 可使用 `backup_api`。
 
-**建议新建独立的 `backup-manager` 仓库。** 用于存放和发布统一工具、测试与版本清单；各服务自己的 `.backup.yaml` 留在各自的仓库。工具可部署到现有主仓库，但工具版本会和服务数据版本耦合，不推荐。
+## 单个服务的配置
 
-## 交付文件
+在服务目录放置 `.backup.yaml`：
 
-- `backup.py`: SQLite VACUUM INTO / backup API、原子快照替换、quick_check、仅缺失恢复、Git Commit/Push、Compose up/down/check。
-- `service.sh`: 通过 URL 运行的通用启动器，按 `stable.json` 下载和 SHA-256 验证工具；支持离线缓存；首次缺少 PyYAML 时创建公用 venv 安装依赖。
-- `stable.json`: 发布清单，含工具 URL、版本、SHA-256。
-- `examples/memos/.backup.yaml`、`examples/linkding/.backup.yaml`: 配置示例。
-- `tests/test_mvp.py`: 自动化基础测试。
+```yaml
+version: 1
 
-## 新建中央仓库并发布
+databases:
+  - type: sqlite
+    source: data/app.db
+    snapshot: backups/app.db
+    method: vacuum               # vacuum 或 backup_api
+    timeout_seconds: 300         # 每个数据库备份的 SQLite 操作时间预算
+    restore_mode: '0600'
+    # restore_uid: 1000          # 按容器实际运行身份设置
+    # restore_gid: 1000
 
-1. 创建一个 **推荐公开读取** 的 `backup-manager` 仓库（不用公开服务数据仓库）。上传 `backup.py`、`stable.json`。最初也可把全部项目推入这个仓库。
-2. `stable.json` 中将 `OWNER` 换成实际 GitHub 用户或组织；确保 `url` 指向真实的 `backup.py` 下载路径。更新 `backup.py` 后，用 `sha256sum backup.py` 计算新值并更新 `stable.json.sha256`；若发布新功能，请同时改 `version`。
-3. 各业务仓库只加入 `.backup.yaml`，调整路径、分支、权限及 Compose 文件。`service.sh` 放在统一工具仓库通过 URL 下载。
-4. 在服务仓库根目录执行 `curl -fsSL https://raw.githubusercontent.com/OWNER/backup-manager/main/service.sh | bash -s -- check`（将 OWNER 替换成实际用户名）。其他子命令同理。
+restore:
+  policy: if_missing
 
-**更新策略**：中央仓库提交新的 `backup.py`，更新 `stable.json` 的版本与 SHA-256；各节点下一次执行时会读取清单、校验并缓存新版工具。公网 URL 必须 HTTPS；脚本执行中央发布的代码，务必限制中央仓库写权限。生产环境建议将稳定清单提交变更纳入审查，先在测试节点验证。若下载清单失败，则使用本地缓存的清单和已缓存文件。
+git:
+  enabled: true
+  remote: origin
+  branch: master                 # 必须与服务仓库当前分支一致
+  message: 'backup: snapshot'
+  paths:                         # 额外提交的确切文件，可省略
+    - docker-compose.yaml
 
-**私有中央仓库**：匿名 HTTPS raw 地址不可用。请先在内部受控 HTTPS 域名发布这两个文件，或者修改启动器使用带身份验证的下载方式。不要将 GitHub Token 写进业务仓库。
-
-## 本地测试（不访问远程工具 URL）
-
-在服务仓库内（本地脚本通过标准输入执行）：
-
-```bash
-BACKUP_MANAGER_LOCAL=/path/to/backup-manager/backup.py bash /path/to/backup-manager/service.sh check
-BACKUP_MANAGER_LOCAL=/path/to/backup-manager/backup.py bash /path/to/backup-manager/service.sh restore
-BACKUP_MANAGER_LOCAL=/path/to/backup-manager/backup.py bash /path/to/backup-manager/service.sh backup
+deploy:
+  enabled: true
+  compose_file: docker-compose.yaml
 ```
 
-本地模式需先安装 PyYAML：`python3 -m pip install 'PyYAML>=6,<7'`（推荐在虚拟环境中执行）。
+所有路径相对于服务目录。快照文件和 `.backup.yaml` 自动加入提交，`git.paths` 只需列额外文件；旧配置重复列出快照和配置文件也兼容。该列表不接受目录、通配符、Git pathspec 或源数据库及其边车文件。敏感文件只有在你明确配置时才会纳入，因此不要加入 `.env`、密钥等文件。
 
-## 命令
+工具根据 `source` 自动维护 Git 本地的 `.git/info/exclude` 生成块，忽略源库、WAL/SHM/journal、任务锁和自身临时文件，保留用户原有规则。无需另外维护备份专用 `.gitignore`。如果运行数据已经被 Git 跟踪，工具会停止并要求手动处理，不会自动删除已有跟踪记录。快照必须位于可被 Git 暂存的位置，工具不会强制绕过现有忽略规则。
+
+只有备份需求时，可以设置 `deploy.enabled: false`；不使用 Git 时设置 `git.enabled: false`。配置中错误的类型、重复 YAML 键、未知字段及文件路径冲突会在执行前被拒绝。
+
+完整示例见 `examples/memos/.backup.yaml` 和 `examples/linkding/.backup.yaml`。应用数据库位置、Compose 挂载和容器 UID/GID 需要按实际服务核对。
+
+## 通过 curl 执行
+
+修改推送到中央仓库后，可直接使用 Raw 入口：
 
 ```bash
-# 以下命令应在含 .backup.yaml 的仓库根目录执行；OWNER 是占位符
-curl -fsSL https://raw.githubusercontent.com/OWNER/backup-manager/main/service.sh | bash -s -- check
-curl -fsSL https://raw.githubusercontent.com/OWNER/backup-manager/main/service.sh | bash -s -- backup
-curl -fsSL https://raw.githubusercontent.com/OWNER/backup-manager/main/service.sh | bash -s -- restore
-curl -fsSL https://raw.githubusercontent.com/OWNER/backup-manager/main/service.sh | bash -s -- restore --dry-run
-curl -fsSL https://raw.githubusercontent.com/OWNER/backup-manager/main/service.sh | bash -s -- up
+cd /srv/my-service
+curl -fsSL https://raw.githubusercontent.com/ahzknarf/backup_manager/master/service.sh | bash -s -- backup
 ```
 
-注意：`curl | bash` 是将下载的启动器直接执行；只有在你完全信任中央仓库且允许其执行代码时才使用。HTTPS 和 `stable.json` 的 SHA-256 仅验证 `backup.py`，不能防范中央发布源本身被恶意修改。更严格的生产方案应为启动器固定校验签名、下载后独立验证，或经内部可信发布服务提供。首次运行需要联网，之后如需离线执行需使用已缓存的引擎直接调用。
+启动器默认从实际仓库 `ahzknarf/backup_manager` 的 `master` 分支读取开发清单。所有命令都可以通过 `bash -s --` 传入：
 
-`backup.py` 自身也可运行：`python3 backup.py --repo /path/to/service backup`。
+```bash
+# 在服务目录内执行；URL 为下一节启用 Pages 后的入口
+curl -fsSL https://ahzknarf.github.io/backup_manager/run | bash -s -- check
+curl -fsSL https://ahzknarf.github.io/backup_manager/run | bash -s -- check --strict
+curl -fsSL https://ahzknarf.github.io/backup_manager/run | bash -s -- backup
+curl -fsSL https://ahzknarf.github.io/backup_manager/run | bash -s -- restore --dry-run
+curl -fsSL https://ahzknarf.github.io/backup_manager/run | bash -s -- restore
+curl -fsSL https://ahzknarf.github.io/backup_manager/run | bash -s -- up
+curl -fsSL https://ahzknarf.github.io/backup_manager/run | bash -s -- down
 
-## 重要安全和恢复约束
+# 可以从任意目录指定服务位置；全局选项放在子命令之前
+curl -fsSL https://ahzknarf.github.io/backup_manager/run | bash -s -- --repo /srv/my-service --lock-timeout 30 backup
+```
 
-- **已有源数据库永不覆盖**。源文件不存在，但存在孤立的 `-wal/-shm`，会停止以避免数据损坏。恢复操作会校验快照，并要求 Docker Compose 没有正在运行的服务。
-- 若数据库缺失且快照也缺失，`up` 会失败而不是启动一个空数据库。
-- `.gitignore` 忽略运行中的数据库和 `-wal/-shm` 文件；只提交快照。正确的容器内 UID/GID 可能需要在 `restore_uid`, `restore_gid`, `restore_mode` 中指定。
-- `git.paths` 明确列出允许自动暂存的路径，防止 `git add .` 导致敏感信息或临时文件被意外提交。`.env` 这类敏感文件不要随意配置进备份路径。
-- Git 在提交之前 fetch 远端并拒绝自动合并远端领先/分叉的提交；若有既存 staged 更改，会拒绝生成备份提交。网络失败后下次仍会尝试 push 之前的提交。需要本地配置 Git user.name/user.email 以及无交互 Git Push 凭据。
-- **还不是完整灾难恢复工具**：本版本仅支持 SQLite 与 Docker Compose；不管理 PostgreSQL、MySQL、文件附件、容器内匿名 volume、加密密钥、集中节点发现或 PVE Submodule 指针更新。
-- 多个数据库分别快照，并非严格全局同一时刻；一次恢复也不对多个文件实现整体事务式回滚。
-- 推荐在非生产克隆上测试 `restore/up`，并确认持久数据挂载和容器权限。不要在正在运行的数据库服务上强制复制覆盖数据库文件。
+`check` 校验配置和已经存在的数据库；尚未生成快照时只报告状态。`check --strict` 要求至少配置一个数据库，且每个快照均存在、非空并通过 SQLite 校验；如果启用部署，还要求 Compose 文件存在。源库不存在而快照完好的状态可通过严格检查，表示可以尝试恢复；孤立边车文件会使检查失败。
 
-## 后续迭代
+`restore` 只恢复缺失的源库，保留已有文件。`up` 先检查部署开关和 Compose 文件，再恢复缺失数据库并执行 `docker compose up -d`。`down` 保留 Docker volumes。禁用部署时，`up/down` 都会在修改数据之前退出。
 
-1. 仓库发现与 PVE SSH 调度（定时执行每个服务仓库中的 `./service.sh backup`）。
-2. 主仓库 Submodule 统一记录各服务备份成功提交的版本。
-3. 增加文件附件/配置的可验证备份、PostgreSQL 支持、Restic、日志通知和恢复清单。
+`curl | bash` 会执行远程入口脚本，入口发布源需要可信；清单中的 SHA-256 校验保护下载完整性，不替代发布源的信任或签名验证。入口获取失败时，外层调用方还应通过 `pipefail` 检测 curl 的失败状态。
 
-## 零文件启动方式与限制
+## 发布短入口
 
-业务仓库无需 `service.sh`，只保留 `.backup.yaml`。统一维护的 `service.sh` 是 HTTP 下载入口（仍需 GitHub 用户名换成实际值），然后它获取 `stable.json` 和 `backup.py`；更新 `service.sh` 会在**下一次调用**时生效，更新 `backup.py` 必须同步更新清单和 SHA-256。正在执行的任务不会热更新。
+仓库提供 `.github/workflows/pages.yml`，由手动运行工作流或推送 `v*` 标签触发。它先运行测试并核对清单，再生成和部署仅含启动器、清单的 Pages 站点。
 
-`bash -s --` 后的参数直接透传给 `backup.py`。务必在仓库根目录运行，不支持随意从其他目录调用。脚本的执行身份必须具有 SQLite 文件读写权限和（启用时）Git Push 权限。`backup.py` 依赖 PyYAML；如系统没有则启动器会尝试创建虚拟环境并安装。
+1. 将修改提交并推送到这个仓库。
+2. 在 GitHub 仓库的 **Settings → Pages → Build and deployment → Source** 选择 **GitHub Actions**。
+3. 在 **Actions → Publish backup launcher → Run workflow** 发布已经提交的版本。
+4. 发布成功后使用 `https://ahzknarf.github.io/backup_manager/run`。本地存在工作流文件并不代表该地址已经上线。
 
-当前示例仓库是公开读取的分发方案；私有仓库的 Raw URL 不提供匿名访问。
+发布出的 `run` 自动从同一站点获取 `stable.json`；清单固定到该次发布的完整 Git commit URL，并校验 `backup.py` 的 SHA-256，避免脚本和清单在分支更新期间不一致。源码 Raw 入口使用的是开发清单；稳定节点建议使用 Pages 入口。
+
+如果有自己的域名，在 Pages 设置中配置自定义域名、DNS 和 HTTPS，再重新运行发布工作流。工作流会根据 Pages 实际站点地址生成清单入口。例如配置完成后可以使用：
+
+```bash
+curl -fsSL https://bk.example.com/run | bash -s -- backup
+```
+
+`bk.example.com` 是示意域名。也可通过现有 HTTPS 服务反向代理 `/run`；如果只是把 GitHub 入口重定向到短域名，它仍会使用原入口内的清单地址。DNS CNAME 到 Raw 主机本身不能完成 HTTPS 与路径映射。
+
+## 缓存、离线与更新
+
+启动器先准备 PyYAML：优先使用当前 Python 已有的依赖，否则在公用缓存目录创建 venv，安装固定的 `PyYAML==6.0.3`。本地模式不会安装依赖。
+
+每个清单地址使用独立缓存；引擎以 SHA-256 命名，不会覆盖正在执行的旧版本。只有清单字段、下载文件哈希和 Python 语法全部通过校验后，才原子更新当前清单，同时保留上一可用版本。清单下载失败、更新文件缺失、哈希不符或缓存损坏时，尝试使用已经验证的当前版本或上一版本；没有任何可验证版本则退出。
+
+| 环境变量 | 用途 |
+| --- | --- |
+| `BACKUP_MANAGER_MANIFEST_URL` | 覆盖中央清单地址，必须是 HTTPS |
+| `BACKUP_MANAGER_CACHE_DIR` | 公用缓存目录，默认 `~/.cache/backup-manager` |
+| `BACKUP_MANAGER_OFFLINE=1` | 使用已验证缓存，不下载清单、引擎或 pip 包 |
+| `BACKUP_MANAGER_LOCAL` | 使用指定的本地 `backup.py`，跳过远程分发与依赖安装 |
+
+首次运行需要网络和可用的 Python venv/pip。`curl` 获取入口本身需要网络；离线时需执行集中安装的 `service.sh`，或直接用相应 Python 调用已缓存的引擎。不同清单地址的缓存互不借用；从旧版缓存结构升级后需要先联网初始化一次。
+
+任务级锁位于服务目录 `.backup-manager.lock`，覆盖检查、备份、Git、恢复和 Compose 操作。默认遇到重叠任务立即失败，可用 `--lock-timeout` 等待。锁文件是自动生成的运行文件，正常退出后仍保留，请勿删除正在使用的锁文件。
+
+## 本地开发与发布校验
+
+```bash
+python3 -m venv .venv
+.venv/bin/python -m pip install -r requirements.txt
+.venv/bin/python -m unittest discover -s tests -v
+bash -n service.sh
+
+# 修改 backup.py 后更新开发清单版本、URL 与 SHA
+.venv/bin/python scripts/release.py manifest
+.venv/bin/python scripts/release.py manifest --check
+
+# 本地调用服务目录，不下载远程工具
+.venv/bin/python backup.py --repo /srv/my-service check
+BACKUP_MANAGER_LOCAL="$PWD/backup.py" PATH="$PWD/.venv/bin:$PATH" bash service.sh --repo /srv/my-service backup
+
+# 构建已提交版本的 Pages 产物；输出目录必须为空
+.venv/bin/python scripts/release.py pages --base-url https://ahzknarf.github.io/backup_manager --output dist
+```
+
+`backup.py` 的 `VERSION` 是发布版本来源；新增功能时更新它，然后运行 `manifest` 命令。CI 会核对仓库中的 `stable.json`，避免忘记更新 SHA。Pages 构建还会拒绝引擎或启动器与指定提交不一致的工作区，防止未提交代码被错误标记为旧提交。
+
+测试使用临时 SQLite、本地 Git bare 仓库和模拟下载；Docker 状态通过命令结果模拟，测试不会启动或停止生产容器。覆盖路径碰撞、WAL 数据、超时、任务锁、恢复竞态、Git 失败重试、缓存回退和发布产物。
+
+## 备份与恢复边界
+
+- 目前覆盖 SQLite、Git 和 Compose；PostgreSQL、MySQL、附件目录、匿名 volume、加密密钥、PVE 调度尚未实现，需要单独备份。
+- SQLite 热备份包含已经提交的 WAL 数据；快照必须是独立数据库，存在 WAL/SHM/journal 边车文件时拒绝替换或恢复。
+- `timeout_seconds` 限制单库备份的 SQLite 工作和锁等待；文件系统 I/O、fsync 或内核阻塞不属于可精确中断的时间预算。
+- Git 在创建快照前检查分支、既有暂存内容、运行库跟踪状态和远端历史，拒绝自动合并远端领先或分叉。
+- 自动提交使用独立暂存索引，并占用 Git 标准 index lock。暂存或提交失败保留原索引；提交成功而推送失败时，下次任务会重推已有提交。进程被强制终止后若残留 Git index lock，需要先确认无 Git 进程，再人工处理。
+- 恢复使用原子、不覆盖目标的链接操作；容器运行、暂停、重启、状态未知或查询失败时拒绝恢复。`deploy.enabled: false` 的手动恢复由调用者确保数据库没有被其他进程使用。
+- 多个数据库分别快照，未实现跨库全局一致性；部分备份失败时不提交 Git，但已经成功生成的快照会保留。多个数据库恢复也不是整体事务，需做真实的恢复演练。
+- SQLite `quick_check` 验证结构完整性，不验证应用业务内容。Git 备份保留历史数据，仓库应私有并配置恰当的访问权限、容量管理和无交互认证。

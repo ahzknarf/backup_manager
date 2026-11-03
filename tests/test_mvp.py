@@ -1,4 +1,5 @@
 import os
+from contextlib import closing
 from pathlib import Path
 import sqlite3
 import subprocess
@@ -50,10 +51,12 @@ deploy:
         con.commit()
         con.close()
         self.tool('restore')
-        self.assertEqual(sqlite3.connect(self.source).execute('select value from items').fetchone()[0], 'live')
+        with closing(sqlite3.connect(self.source)) as connection:
+            self.assertEqual(connection.execute('select value from items').fetchone()[0], 'live')
         self.source.unlink()
         self.tool('restore')
-        self.assertEqual(sqlite3.connect(self.source).execute('select value from items').fetchone()[0], 'original')
+        with closing(sqlite3.connect(self.source)) as connection:
+            self.assertEqual(connection.execute('select value from items').fetchone()[0], 'original')
 
     def test_missing_snapshot_is_error(self):
         self.source.unlink()
@@ -72,9 +75,6 @@ deploy:
         (self.repo / '.backup.yaml').write_text(txt)
         self.tool('backup', expected=1)
 
-if __name__ == '__main__':
-    unittest.main()
-
 class GitTests(unittest.TestCase):
     def test_commit_push_and_repeat(self):
         with tempfile.TemporaryDirectory() as td:
@@ -87,6 +87,8 @@ class GitTests(unittest.TestCase):
                 return subprocess.run(['git', *args], cwd=repo, check=True, text=True, capture_output=True).stdout.strip()
             git('config', 'user.email', 'backup@example.test')
             git('config', 'user.name', 'Backup Test')
+            git('config', 'commit.gpgsign', 'false')
+            git('config', 'core.hooksPath', str(repo / '.git/hooks'))
             (repo / 'data').mkdir()
             db = repo / 'data/db.sqlite3'
             con = sqlite3.connect(db)
@@ -117,3 +119,6 @@ deploy:
                 self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
             self.assertTrue((repo / 'data/backup.sqlite3').exists())
             self.assertEqual(git('rev-list', '--count', 'HEAD'), '2')
+
+if __name__ == '__main__':
+    unittest.main()

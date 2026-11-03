@@ -1,5 +1,5 @@
 {
-  "version": "v0.1.0",
-  "url": "https://raw.githubusercontent.com/ahzknarf/backup-manager/main/backup.py",
-  "sha256": "656e0bbfd8b2e7c03608a6ce01e790f250c0a3ed9c033cdb3362339c911af2ff"
+  "version": "v0.2.0",
+  "url": "https://raw.githubusercontent.com/ahzknarf/backup_manager/master/backup.py",
+  "sha256": "08ca7ba62289025146056e6eaefa58d6a2ad21139b7fd724c961852fb88646fa"
 }

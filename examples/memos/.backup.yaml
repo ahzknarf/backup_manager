@@ -3,8 +3,9 @@ version: 1
 databases:
   - type: sqlite
     source: data/memos_prod.db
-    snapshot: data/backup_memos_prod.db
+    snapshot: backups/memos_prod.db
     method: vacuum
+    timeout_seconds: 300
     restore_mode: '0600'
 
 restore:
@@ -16,8 +17,6 @@ git:
   branch: master
   message: 'backup: memos'
   paths:
-    - data/backup_memos_prod.db
-    - .backup.yaml
     - docker-compose.yaml
 
 deploy:
